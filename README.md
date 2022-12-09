@@ -5,9 +5,9 @@ The `/cmd_vel` topic also works and you can send commands to the spot via e.g. r
 This project is still WIP.
 
 ## Issues
-The ros actions have not yet been ported. The RobotModel is not visible in rviz so far.
-DepthCloud is not visible in rviz2 either, because DepthCloud has not been ported for rviz2 yet.
-The `spot_viz` package is also missing.
+1. ROS2 Action: "NavTo" has not test yet.
+2. Arm control still got some errors.
+3. cmd_vel working weird sometimes.
 
 <img src="spot.jpeg" width="350">
 

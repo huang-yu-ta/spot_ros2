@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionServer
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.action import ActionServer, CancelResponse
 import builtin_interfaces.msg
 from builtin_interfaces.msg import Time, Duration
 
@@ -36,6 +37,10 @@ from spot_msgs.msg import Feedback
 from spot_msgs.msg import MobilityParams
 from spot_msgs.action import NavigateTo
 from spot_msgs.action import Trajectory
+from spot_msgs.srv import ArmForceTrajectory
+from spot_msgs.srv import ArmJointMovement
+from spot_msgs.srv import GripperAngleMove
+from spot_msgs.srv import HandPose
 from spot_msgs.srv import ListGraph
 from spot_msgs.srv import SetLocomotion
 from spot_msgs.srv import ClearBehaviorFault
@@ -356,65 +361,89 @@ class SpotROS():
             response.message = 'Error:{}'.format(e)
             return response
 
+    def handle_trajectory_cancel(self, req):
+        return CancelResponse.ACCEPT
+
     def handle_trajectory(self, req):
         """ROS actionserver execution handler to handle receiving a request to move to a location"""
-        if req.target_pose.header.frame_id != 'body':
-            self.trajectory_server.set_aborted(TrajectoryResult(False, 'frame_id of target_pose must be \'body\''))
-            return
-        if req.duration.data.to_sec() <= 0:
-            self.trajectory_server.set_aborted(TrajectoryResult(False, 'duration must be larger than 0'))
-            return
+        result = Trajectory.Result()
+        feedback = Trajectory.Feedback()
+        if req.request.target_pose.header.frame_id != 'body':
+            req.abort()
+            result.success = False
+            result.message = 'frame_id of target_pose must be \'body\''
+            return result
+        if req.request.duration.sec <= 0:
+            req.abort()
+            result.success = False
+            result.message = 'duration must be larger than 0'
+            return result
 
-        cmd_duration = rclpy.Duration(req.duration.data.secs, req.duration.data.nsecs)
         resp = self.spot_wrapper.trajectory_cmd(
-                        goal_x=req.target_pose.pose.position.x,
-                        goal_y=req.target_pose.pose.position.y,
+                        goal_x=req.request.target_pose.pose.position.x,
+                        goal_y=req.request.target_pose.pose.position.y,
                         goal_heading=math_helpers.Quat(
-                            w=req.target_pose.pose.orientation.w,
-                            x=req.target_pose.pose.orientation.x,
-                            y=req.target_pose.pose.orientation.y,
-                            z=req.target_pose.pose.orientation.z
+                            w=req.request.target_pose.pose.orientation.w,
+                            x=req.request.target_pose.pose.orientation.x,
+                            y=req.request.target_pose.pose.orientation.y,
+                            z=req.request.target_pose.pose.orientation.z
                             ).to_yaw(),
-                        cmd_duration=cmd_duration.to_sec(),
-                        precise_position=req.precise_positioning,
+                        cmd_duration=req.request.duration.sec,
+                        precise_position=req.request.precise_positioning,
                         )
 
-        def timeout_cb(trajectory_server, _):
-            trajectory_server.publish_feedback(TrajectoryFeedback("Failed to reach goal, timed out"))
-            trajectory_server.set_aborted(TrajectoryResult(False, "Failed to reach goal, timed out"))
+        def timeout_cb(trajectory_server):
+            feedback.feedback = "Failed to reach goal, timed out"
+            trajectory_server.publish_feedback(feedback)
+            trajectory_server.abort()
+            result.success = False
+            result.message = "Failed to reach goal, timed out"
+            return result
 
         # Abort the actionserver if cmd_duration is exceeded - the driver stops but does not provide feedback to
         # indicate this so we monitor it ourselves
-        cmd_timeout = rclpy.Timer(cmd_duration, functools.partial(timeout_cb, self.trajectory_server), oneshot=True)
+        cmd_timeout = self.node.create_timer(req.request.duration.sec, functools.partial(timeout_cb, req))
 
         # The trajectory command is non-blocking but we need to keep this function up in order to interrupt if a
         # preempt is requested and to return success if/when the robot reaches the goal. Also check the is_active to
         # monitor whether the timeout_cb has already aborted the command
-        rate = rclpy.Rate(10)
-        while not rclpy.is_shutdown() and not self.trajectory_server.is_preempt_requested() and not self.spot_wrapper.at_goal and self.trajectory_server.is_active():
+        rate = self.node.create_rate(10)
+        while rclpy.ok() and not self.spot_wrapper.at_goal and req.is_active and not req.is_cancel_requested:
             if self.spot_wrapper.near_goal:
                 if self.spot_wrapper._last_trajectory_command_precise:
-                    self.trajectory_server.publish_feedback(TrajectoryFeedback("Near goal, performing final adjustments"))
+                    feedback.feedback = "Near goal, performing final adjustments"
+                    req.publish_feedback(feedback)
                 else:
-                    self.trajectory_server.publish_feedback(TrajectoryFeedback("Near goal"))
+                    feedback.feedback = "Near goal"
+                    req.publish_feedback(feedback)
             else:
-                self.trajectory_server.publish_feedback(TrajectoryFeedback("Moving to goal"))
+                feedback.feedback = "Moving to goal"
+                req.publish_feedback(feedback)
             rate.sleep()
 
+        # self.node.destroy_timer(cmd_timeout)
+        cmd_timeout.destroy()
         # If still active after exiting the loop, the command did not time out
-        if self.trajectory_server.is_active():
-            cmd_timeout.shutdown()
-            if self.trajectory_server.is_preempt_requested():
-                self.trajectory_server.publish_feedback(TrajectoryFeedback("Preempted"))
-                self.trajectory_server.set_preempted()
-                self.spot_wrapper.stop()
+        if req.is_active:
+            # if req.is_preempt_requested():
+            #     req.publish_feedback(TrajectoryFeedback("Preempted"))
+            #     req.set_preempted()
+            #     self.spot_wrapper.stop()
 
             if self.spot_wrapper.at_goal:
-                self.trajectory_server.publish_feedback(TrajectoryFeedback("Reached goal"))
-                self.trajectory_server.set_succeeded(TrajectoryResult(resp[0], resp[1]))
+                feedback.feedback = "Reached goal"
+                result.success = resp[0]
+                result.message = resp[1]
+                req.publish_feedback(feedback)
+                req.succeed()
             else:
-                self.trajectory_server.publish_feedback(TrajectoryFeedback("Failed to reach goal"))
-                self.trajectory_server.set_aborted(TrajectoryResult(False, "Failed to reach goal"))
+                feedback.feedback = "Failed to reach goal"
+                result.success = False
+                result.message = "Failed to reach goal"
+                req.publish_feedback(feedback)
+                req.abort()
+
+        return result
 
     def cmdVelCallback(self, data):
         """Callback for cmd_vel command"""
@@ -442,33 +471,40 @@ class SpotROS():
         response.waypoints_id = self.spot_wrapper.list_graph(request.upload_path)
         return response
 
-    def handle_navigate_to_feedback(self):
+    def handle_navigate_to_feedback(self, req):
         """Thread function to send navigate_to feedback"""
+        feedback = NavigateTo.Feedback()
         while rclpy.ok() and self.run_navigate_to:
             localization_state = self.spot_wrapper._graph_nav_client.get_localization_state()
             if localization_state.localization.waypoint_id:
-                self.navigate_as.publish_feedback(NavigateToFeedback(localization_state.localization.waypoint_id))
-            rclpy.Rate(10).sleep()
+                feedback.waypoint_id = localization_state.localization.waypoint_id
+                req.publish_feedback(feedback)
+            self.node.create_rate(10).sleep()
 
-    def handle_navigate_to(self, msg):
+    def handle_navigate_to(self, req):
         """ROS service handler to run mission of the robot.  The robot will replay a mission"""
+        result = NavigateTo.Result()
         # create thread to periodically publish feedback
-        feedback_thraed = threading.Thread(target = self.handle_navigate_to_feedback, args = ())
+        feedback_thraed = threading.Thread(target = functools.partial(self.handle_navigate_to_feedback, req), args = ())
         self.run_navigate_to = True
         feedback_thraed.start()
         # run navigate_to
-        resp = self.spot_wrapper.navigate_to(upload_path = msg.upload_path,
-                                             navigate_to = msg.navigate_to,
-                                             initial_localization_fiducial = msg.initial_localization_fiducial,
-                                             initial_localization_waypoint = msg.initial_localization_waypoint)
+        resp = self.spot_wrapper.navigate_to(upload_path = req.request.upload_path,
+                                             navigate_to = req.request.navigate_to,
+                                             initial_localization_fiducial = req.request.initial_localization_fiducial,
+                                             initial_localization_waypoint = req.request.initial_localization_waypoint)
         self.run_navigate_to = False
         feedback_thraed.join()
 
         # check status
         if resp[0]:
-            self.navigate_as.set_succeeded(NavigateToResult(resp[0], resp[1]))
+            req.succeed()
         else:
-            self.navigate_as.set_aborted(NavigateToResult(resp[0], resp[1]))
+            req.abort()
+
+        result.success = resp[0]
+        result.message = resp[1]
+        return result
 
     def populate_camera_static_transforms(self, image_data):
         """Check data received from one of the image tasks and use the transform snapshot to extract the camera frame
@@ -498,6 +534,70 @@ class SpotROS():
                                                  transform.parent_tform_child)
             self.camera_static_transforms.append(static_tf)
             self.camera_static_transform_broadcaster.sendTransform(self.camera_static_transforms)
+
+    # Arm functions ##################################################
+    def handle_arm_stow(self, request, response):
+        """ROS service handler to command the arm to stow, home position """
+        resp = self.spot_wrapper.arm_stow()
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+
+    def handle_arm_unstow(self, request, response):
+        """ROS service handler to command the arm to unstow, joints are all zeros"""
+        resp = self.spot_wrapper.arm_unstow()
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+
+    def handle_arm_joint_move(self, request: ArmJointMovement.Request, response: ArmJointMovement.Response):
+        """ROS service handler to send joint movement to the arm to execute"""        
+        resp = self.spot_wrapper.arm_joint_move(joint_targets = request.joint_target)
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+    
+    def handle_force_trajectory(self, request: ArmForceTrajectory.Request, response: ArmForceTrajectory.Response):
+        """ROS service handler to send a force trajectory up or down a vertical force"""
+        resp = self.spot_wrapper.force_trajectory(data=request)
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+    
+    def handle_gripper_open(self, request, response):
+        """ROS service handler to open the gripper"""
+        resp = self.spot_wrapper.gripper_open()
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+
+    def handle_gripper_close(self, request, response):
+        """ROS service handler to close the gripper"""
+        resp = self.spot_wrapper.gripper_close()
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+   
+    def handle_gripper_angle_open(self, request: GripperAngleMove.Request, response: GripperAngleMove.Response):
+        """ROS service handler to open the gripper at an angle"""
+        resp = self.spot_wrapper.gripper_angle_open(gripper_ang = request.gripper_angle)
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+    
+    def handle_arm_carry(self, request, response):
+        """ROS service handler to put arm in carry mode"""
+        resp = self.spot_wrapper.arm_carry()
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
+    
+    def handle_hand_pose(self, request: HandPose.Request, response: HandPose.Response):
+        """ROS service to give a position to the gripper"""
+        resp = self.spot_wrapper.hand_pose(pose_points = request.pose_point)
+        response.success = resp[0]
+        response.message = resp[1]
+        return response
 
     def shutdown(self, sig, frame):
         self.node.get_logger().info("Shutting down ROS driver for Spot")
@@ -689,13 +789,23 @@ def main(args = None):
         node.create_service(SetVelocity, "max_velocity", spot_ros.handle_max_vel)
         node.create_service(ClearBehaviorFault, "clear_behavior_fault", spot_ros.handle_clear_behavior_fault)
 
+        # Arm Services #########################################
+        node.create_service(Trigger, "arm_stow", spot_ros.handle_arm_stow)
+        node.create_service(Trigger, "arm_unstow", spot_ros.handle_arm_unstow)
+        node.create_service(Trigger, "gripper_open", spot_ros.handle_gripper_open)
+        node.create_service(Trigger, "gripper_close", spot_ros.handle_gripper_close)
+        node.create_service(Trigger, "arm_carry", spot_ros.handle_arm_carry)
+        node.create_service(GripperAngleMove, "gripper_angle_open", spot_ros.handle_gripper_angle_open)
+        node.create_service(ArmJointMovement, "arm_joint_move", spot_ros.handle_arm_joint_move)
+        node.create_service(ArmForceTrajectory, "force_trajectory", spot_ros.handle_force_trajectory)
+        node.create_service(HandPose, "gripper_pose", spot_ros.handle_hand_pose)
+        #########################################################
+
         node.create_service(ListGraph, "list_graph", spot_ros.handle_list_graph)
         
         spot_ros.navigate_as = ActionServer(node, NavigateTo, 'navigate_to', spot_ros.handle_navigate_to)
-        #spot_ros.navigate_as.start() # As is online
 
-        spot_ros.trajectory_server = ActionServer(node, Trajectory, 'trajectory', spot_ros.handle_trajectory)
-        #spot_ros.trajectory_server.start()
+        spot_ros.trajectory_server = ActionServer(node, Trajectory, 'trajectory', execute_callback=spot_ros.handle_trajectory, cancel_callback=spot_ros.handle_trajectory_cancel)
         
         # Register Shutdown Handle
         # rclpy.on_shutdown(spot_ros.shutdown) ############## Shutdown Handle
@@ -715,7 +825,8 @@ def main(args = None):
         update_thraed.start()
         signal.signal(signal.SIGTERM, spot_ros.shutdown)
 
-        rclpy.spin(node)
+        executor = MultiThreadedExecutor()
+        rclpy.spin(node, executor=executor)
         node.get_logger().info("Shutdown")
         ## Spot shutdown handle; disconnect spot
         node.destroy_node()

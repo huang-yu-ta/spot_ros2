@@ -41,6 +41,15 @@ friendly_joint_names["hr.hx"] = "rear_right_hip_x"
 friendly_joint_names["hr.hy"] = "rear_right_hip_y"
 friendly_joint_names["hr.kn"] = "rear_right_knee"
 
+# arm joints
+friendly_joint_names["arm0.sh0"] = "arm_joint1"
+friendly_joint_names["arm0.sh1"] = "arm_joint2"
+friendly_joint_names["arm0.el0"] = "arm_joint3"
+friendly_joint_names["arm0.el1"] = "arm_joint4"
+friendly_joint_names["arm0.wr0"] = "arm_joint5"
+friendly_joint_names["arm0.wr1"] = "arm_joint6"
+friendly_joint_names["arm0.f1x"] = "arm_gripper"
+
 def populateTransformStamped(time, parent_frame, child_frame, transform):
     """Populates a TransformStamped message
     Args:
