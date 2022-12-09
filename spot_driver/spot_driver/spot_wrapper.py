@@ -27,7 +27,7 @@ from bosdyn.client.exceptions import InternalServerError
 from . import graph_nav_util
 
 from bosdyn.api import arm_command_pb2
-import bosdyn.api.robot_state_pb2 as robot_state_proto
+from bosdyn.api import robot_state_pb2
 from bosdyn.api import basic_command_pb2
 from bosdyn.api import synchronized_command_pb2
 from bosdyn.api import robot_command_pb2
@@ -159,10 +159,7 @@ class AsyncIdle(AsyncPeriodicQuery):
                 if status == basic_command_pb2.StandCommand.Feedback.STATUS_IS_STANDING:
                     self._spot_wrapper._is_standing = True
                     self._spot_wrapper._last_stand_command = None
-                elif status == basic_command_pb2.StandCommand.Feedback.STATUS_IN_PROGRESS:
-                    self._spot_wrapper._is_standing = False
                 else:
-                    self._logger.warn("Stand command in unknown state")
                     self._spot_wrapper._is_standing = False
             except (ResponseError, RpcError) as e:
                 self._logger.error("Error when getting robot command feedback: %s", e)
@@ -207,11 +204,7 @@ class AsyncIdle(AsyncPeriodicQuery):
                 elif status == basic_command_pb2.SE2TrajectoryCommand.Feedback.STATUS_NEAR_GOAL:
                     is_moving = True
                     self._spot_wrapper._near_goal = True
-                elif status == basic_command_pb2.SE2TrajectoryCommand.Feedback.STATUS_UNKNOWN:
-                    self._spot_wrapper._trajectory_status_unknown = True
-                    self._spot_wrapper._last_trajectory_command = None
                 else:
-                    self._logger.error("Received trajectory command status outside of expected range, value is {}".format(status))
                     self._spot_wrapper._last_trajectory_command = None
             except (ResponseError, RpcError) as e:
                 self._logger.error("Error when getting robot command feedback: %s", e)
@@ -1385,7 +1378,7 @@ class SpotWrapper():
             while not motors_on:
                 future = self._robot_state_client.get_robot_state_async()
                 state_response = future.result(timeout=10) # 10 second timeout for waiting for the state response.
-                if state_response.power_state.motor_power_state == robot_state_proto.PowerState.STATE_ON:
+                if state_response.power_state.motor_power_state == robot_state_pb2.PowerState.STATE_ON:
                     motors_on = True
                 else:
                     # Motors are not yet fully powered on.
